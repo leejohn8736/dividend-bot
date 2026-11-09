@@ -1,93 +1,65 @@
-name: Liquidity Strategy
+name: Stock Alert Bot
 
 on:
   schedule:
-    - cron: '0 21 * * 5'  # 매주 금요일 UTC 21:00 (한국 시간 토요일 오전 6시)
+    - cron: "40 7 * * 1-5"
+    - cron: "40 21 * * 1-5"
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Execution mode'
-        required: true
-        default: 'live'
-        type: choice
-        options:
-          - live
-          - backtest
-          - optimize
-          - monte_carlo
-          - profile
-      start_date:
-        description: 'Start date for backtest/optimize (YYYY-MM-DD)'
-        required: false
-        default: '2005-01-01'
+      market:
+        description: "KR / US / ALL"
+        default: "ALL"
         type: string
-      end_date:
-        description: 'End date for backtest/optimize (YYYY-MM-DD)'
-        required: false
-        default: '2025-12-31'
-        type: string
-      notify:
-        description: 'Enable Telegram notifications'
-        required: false
-        default: true
-        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-alert-bot
+  cancel-in-progress: false
 
 jobs:
-  run-strategy:
+  run:
     runs-on: ubuntu-latest
-    
-    permissions:
-      contents: read
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-    - name: Cache data directory
-      uses: actions/cache@v4
-      with:
-        path: ./cache
-        key: ${{ runner.os }}-liquidity-data-${{ hashFiles('**/liquidity_regime_strategy.py') }}
-        restore-keys: |
-          ${{ runner.os }}-liquidity-data-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+      - name: Pick market
+        id: m
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            M="${{ github.event.inputs.market }}"
+          elif [ "${{ github.event.schedule }}" = "40 7 * * 1-5" ]; then
+            M="KR"
+          else
+            M="US"
+          fi
+          [ "$M" = "ALL" ] && M="KR US"
+          echo "markets=$M" >> "$GITHUB_OUTPUT"
 
-    - name: Run liquidity strategy (scheduled)
-      if: github.event_name == 'schedule'
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        python liquidity_regime_strategy.py --mode live --notify
+      - name: Run signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bnf_signal.py ${{ steps.m.outputs.markets }}
 
-    - name: Run liquidity strategy (manual)
-      if: github.event_name == 'workflow_dispatch'
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        python liquidity_regime_strategy.py \
-          --mode ${{ github.event.inputs.mode }} \
-          --start ${{ github.event.inputs.start_date }} \
-          --end ${{ github.event.inputs.end_date }} \
-          ${{ fromJSON(github.event.inputs.notify) && '--notify' || '' }} \
-          --output-dir ./checkpoints
-
-    - name: Upload artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: strategy-results-${{ github.run_number }}
-        path: |
-          ./checkpoints/
-          ./logs/
-        retention-days: 30
+      - name: Commit results
+        run: |
+          git config user.name "bot-runner"
+          git config user.email "bot-runner@users.noreply.github.com"
+          git add docs/data state
+          git diff --cached --quiet || git commit -m "signal update $(date -u +%F)"
+          git pull --rebase && git push
