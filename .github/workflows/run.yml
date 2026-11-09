@@ -2,12 +2,9 @@ name: Integrated Stock & Dividend Bot
 
 on:
   schedule:
-    # 1. Dividend Alert / 뉴스 알림 (매일 UTC 00:00 = 한국 시간 오전 9시)
-    - cron: '0 0 * * *'
-    # 2. Stock Alert Bot - 한국장 마감 (평일 UTC 07:40 = 한국 시간 오후 4시 40분)
-    - cron: '40 7 * * 1-5'
-    # 3. Stock Alert Bot - 미국장 마감 (평일 UTC 21:40 = 한국 시간 오전 6시 40분)[cite: 3, 5]
-    - cron: '40 21 * * 1-5'
+    - cron: '0 0 * * *'     # 1. Dividend/News Alert: 매일 UTC 00:00 (한국 시간 오전 9시)
+    - cron: '40 7 * * 1-5'    # 2. Stock Signal (KR): 평일 UTC 07:40 (한국 시간 오후 4시 40분)
+    - cron: '40 21 * * 1-5'   # 3. Stock Signal (US): 평일 UTC 21:40 (한국 시간 오전 6시 40분)
   workflow_dispatch:
     inputs:
       market:
