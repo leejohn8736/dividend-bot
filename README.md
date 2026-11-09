@@ -18,3 +18,10 @@ GitHub Actions 기반 무료 스케줄링
 Python 3.10+
 텔레그램 계정
 GitHub 계정
+
+
+2. 설치
+
+git clone https://github.com/brainer3220/dividend-bot.git
+cd dividend-bot
+pip install -r requirements.txt
