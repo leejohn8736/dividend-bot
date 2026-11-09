@@ -25,3 +25,4 @@ GitHub 계정
 git clone https://github.com/brainer3220/dividend-bot.git
 cd dividend-bot
 pip install -r requirements.txt
+
