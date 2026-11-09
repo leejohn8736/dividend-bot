@@ -1,0 +1,103 @@
+name: Integrated Stock & Dividend Bot
+
+on:
+  schedule:
+    # 1. Dividend Alert / 뉴스 알림 (매일 UTC 00:00 = 한국 시간 오전 9시)
+    - cron: '0 0 * * *'
+    # 2. Stock Alert Bot - 한국장 마감 (평일 UTC 07:40 = 한국 시간 오후 4시 40분)
+    - cron: '40 7 * * 1-5'
+    # 3. Stock Alert Bot - 미국장 마감 (평일 UTC 21:40 = 한국 시간 오전 6시 40분)[cite: 3, 5]
+    - cron: '40 21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "KR / US / ALL"
+        default: "ALL"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: integrated-stock-dividend-bot
+  cancel-in-progress: false
+
+jobs:
+  run-all-tasks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install requests beautifulsoup4 curl_cffi yfinance pandas pytz scipy pyyaml pyarrow pandas_datareader tqdm google-genai
+
+      # -------------------------------------------------------------
+      # [1단계] 배당 및 뉴스 알림 스크립트 실행 (main.py)
+      # -------------------------------------------------------------
+      - name: Run Dividend/News Alert (main.py)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "=== Running Dividend Alert (main.py) ==="
+          if [ -f main.py ]; then
+            timeout 60s python main.py || echo "main.py finished or timed out gracefully."
+          else
+            echo "main.py not found, skipping."
+          fi
+
+      # -------------------------------------------------------------
+      # [2단계] 주식 신호 분석 봇을 위한 시장(Market) 선택 분기 로직
+      # -------------------------------------------------------------
+      - name: Pick market for Signal Bot
+        id: m
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            M="${{ github.event.inputs.market }}"
+          elif [ "${{ github.event.schedule }}" = "40 7 * * 1-5" ]; then
+            M="KR"
+          else
+            M="US"
+          fi
+          [ "$M" = "ALL" ] && M="KR US"
+          echo "markets=$M" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------
+      # [3단계] 주식 신호 봇 스크립트 실행 (bnf_signal.py)
+      # -------------------------------------------------------------
+      - name: Run Stock Signal Bot (bnf_signal.py)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          echo "=== Running Stock Signal Bot (bnf_signal.py) ==="
+          if [ -f bnf_signal.py ]; then
+            python bnf_signal.py ${{ steps.m.outputs.markets }}
+          else
+            echo "bnf_signal.py not found, skipping."
+          fi
+
+      # -------------------------------------------------------------
+      # [4단계] 실행 결과 상태 및 데이터 자동 Git 동기화 (Commit & Push)
+      # -------------------------------------------------------------
+      - name: Commit and push results
+        if: always()
+        run: |
+          git config --global user.name "bot-runner"
+          git config --global user.email "bot-runner@users.noreply.github.com"
+          git add docs/data state sent_links.txt ./checkpoints/ ./logs/ || true
+          git diff --cached --quiet || git commit -m "auto: update integrated bot states and data" || true
+          git pull --rebase && git push origin main || echo "Push skipped"
