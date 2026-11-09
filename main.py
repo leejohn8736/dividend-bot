@@ -1,370 +1,140 @@
 import os
 import sys
-import logging
-import requests
-from datetime import datetime, timedelta
-import pytz
-import pandas as pd
-import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor
-from requests.adapters import Retry, HTTPAdapter
+import datetime
+from bs4 import BeautifulSoup
+from curl_cffi import requests
 
-# 환경 변수 검증
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Telegram 환경 변수가 설정되지 않았습니다.")
+# 깃허브 Secrets에서 텔레그램 토큰 및 채팅방 ID 가져오기
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('dividend_alert.log'),
-        logging.StreamHandler()
-    ]
-)
+# 중복 발송 방지를 위한 기록 파일명
+HISTORY_FILE = "sent_links.txt"
 
-EASTERN_TZ = pytz.timezone('US/Eastern')
+def load_sent_links():
+    """이미 발송한 기사 링크 목록 불러오기"""
+    if not os.path.exists(HISTORY_FILE):
+        return set()
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f if line.strip())
 
-def send_telegram(message):
-    """텔레그램 메시지 전송 함수"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'HTML'
+def save_sent_link(link):
+    """발송한 기사 링크 기록 저장"""
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(link + "\n")
+
+def send_telegram_msg(text):
+    """텔레그램 메시지 단건 발송 함수"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 설정값이 없습니다.")
+        return False
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
+    
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        logging.info("텔레그램 메시지 전송 성공")
-        return True
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 200:
+            print("✅ 텔레그램 기사 전송 성공!")
+            return True
+        else:
+            print(f"❌ 텔레그램 전송 실패 (상태 코드: {response.status_code})")
+            print(f"상세 내용: {response.text}")
+            return False
     except Exception as e:
-        logging.error(f"Telegram 전송 실패: {str(e)}")
+        print(f"❌ 텔레그램 발송 중 네트워크 오류 발생: {e}")
         return False
 
-def fetch_nasdaq_data(query_date):
-    """NASDAQ 배당 데이터 조회"""
-    url = f'https://api.nasdaq.com/api/calendar/dividends?date={query_date}'
-    headers = {
-        'accept': 'application/json, text/plain, */*',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.99 Safari/537.36',
-        'referer': 'https://www.nasdaq.com/'
-    }
-
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-
+def fetch_target_news():
+    """
+    조건에 맞는 최신 기사 1개를 탐색하는 함수
+    - 제목에 필수 키워드 포함
+    - 중복 발송되지 않은 기사
+    - 기자 이름, 날짜, 시간 포함
+    """
+    # 탐색할 핵심 키워드 설정 (원하시는 키워드로 수정 가능)
+    target_keywords = ["삼성전자", "반도체", "AI", "증권", "금리", "주식"]
+    
+    # 예시로 네이버 금융/증권 뉴스 홈 또는 특정 RSS 크롤링 (구조에 맞게 조정 필요)
+    url = "https://news.naver.com/main/list.naver?mode=LS2D&mid=shm&sid1=101&sid2=258"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    sent_links = load_sent_links()
+    
     try:
-        response = session.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        # JSON 파싱 검증
-        json_data = response.json()
-        if not isinstance(json_data, dict):
-            logging.warning(f"NASDAQ API 응답이 dict가 아님 ({query_date}): {type(json_data)}")
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            print(f"⚠️ 뉴스 페이지 접속 실패 (코드: {response.status_code})")
             return None
             
-        logging.info(f"NASDAQ API 조회 성공: {query_date}")
-        return json_data
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-    except requests.exceptions.Timeout:
-        logging.error(f"NASDAQ API 타임아웃 ({query_date})")
-        return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"NASDAQ API 요청 실패 ({query_date}): {str(e)}")
-        return None
-    except ValueError as e:
-        logging.error(f"NASDAQ API JSON 파싱 실패 ({query_date}): {str(e)}")
-        return None
-    except Exception as e:
-        logging.error(f"NASDAQ API 예상치 못한 오류 ({query_date}): {str(e)}")
-        return None
-
-def calculate_last_purchase_date(ex_date):
-    """배당을 받기 위한 최종 매수일 계산 (배당락일 전 영업일)"""
-    try:
-        ex_date_obj = pd.to_datetime(ex_date)
-        # 배당락일 전 영업일 (실제로는 전일까지 매수해야 함)
-        last_purchase_date = ex_date_obj - pd.offsets.BusinessDay(1)
-        return last_purchase_date.strftime('%Y-%m-%d')
-    except Exception as e:
-        logging.error(f"최종 매수일 계산 오류: {str(e)}")
-        return None
-
-def is_purchase_deadline_valid(ex_date, current_date, min_days_ahead=1):
-    """매수 기한이 유효한지 확인 (최소 N일 이상의 여유가 있는지)"""
-    try:
-        ex_date_obj = pd.to_datetime(ex_date).date()
-        # 배당락일이 현재일보다 min_days_ahead일 이상 미래에 있어야 함
-        min_valid_date = current_date + timedelta(days=min_days_ahead)
-        return ex_date_obj >= min_valid_date
-    except Exception as e:
-        logging.error(f"매수 기한 검증 오류: {str(e)}")
-        return False
-
-def process_stock(stock, current_date):
-    """개별 종목 처리"""
-    try:
-        # 필수 필드 검증
-        required_fields = ['symbol', 'companyName', 'dividend_Ex_Date',
-                          'dividend_Rate', 'indicated_Annual_Dividend', 'payment_Date']
-        if not all(stock.get(field) for field in required_fields):
-            logging.warning(f"필수 데이터 누락: {stock.get('symbol', 'Unknown')}")
-            return None
-
-        # 배당락일 파싱 및 검증
-        ex_date_str = stock['dividend_Ex_Date']
+        # 네이버 뉴스 목록형 기준 기사 아이템 파싱
+        news_items = soup.select('.news_list dl, .type06_headline li, .press_edit_news li')
         
-        # 매수 기한이 유효한지 확인 (최소 1일 여유)
-        if not is_purchase_deadline_valid(ex_date_str, current_date, min_days_ahead=1):
-            logging.info(f"제외: {stock['symbol']} (배당락일 {ex_date_str} - 매수 기한 부족)")
-            return None
-
-        # 주가 정보 조회
-        ticker = stock['symbol']
-        try:
-            ticker_info = yf.Ticker(ticker)
-            hist = ticker_info.history(period='5d')
+        for item in news_items:
+            # 제목 및 링크 추출
+            a_tag = item.select_one('a')
+            if not a_tag:
+                continue
+            title = a_tag.get_text(strip=True)
+            link = a_tag.get('href', '')
             
-            if hist.empty:
-                logging.warning(f"주가 데이터 없음: {ticker}")
-                return None
+            if not title or not link or link in sent_links:
+                continue
                 
-            # 가장 최근 유효한 주가 사용
-            price = hist.iloc[-1].Close
-            if pd.isna(price):
-                valid_prices = hist.Close.dropna()
-                if valid_prices.empty:
-                    logging.warning(f"유효한 주가 데이터 없음: {ticker}")
-                    return None
-                price = valid_prices.iloc[-1]
+            # 제목에 키워드 중 하나라도 포함되어 있는지 확인
+            if not any(kw in title for kw in target_keywords):
+                continue
                 
-        except Exception as e:
-            logging.warning(f"주가 조회 실패 {ticker}: {str(e)}")
-            return None
-
-        # 배당 정보 파싱
-        try:
-            dividend_rate = float(stock['dividend_Rate'])
-            annual_dividend = float(stock['indicated_Annual_Dividend'])
-        except (ValueError, TypeError) as e:
-            logging.warning(f"배당 정보 파싱 실패 {ticker}: {str(e)}")
-            return None
-
-        # 배당 수익률 계산
-        dividend_yield = (annual_dividend / price) * 100 if price > 0 else 0
-
-        # 고배당 종목만 필터링 (3% 이상)
-        if dividend_yield >= 3:
-            last_purchase_date = calculate_last_purchase_date(ex_date_str)
+            # 부가 정보(기자명, 작성일시 등) 크롤링 시도 (언론사별 구조에 맞춰 조정)
+            # 예시 데이터 (실제 파싱 구조가 다를 경우 대체 텍스트 삽입)
+            info_tag = item.select_one('.writing, .date, .info')
+            author_date_str = info_tag.get_text(strip=True) if info_tag else "기자 정보 없음 / " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             
             return {
-                'Symbol': ticker,
-                'Name': stock['companyName'],
-                'Ex-Date': ex_date_str,
-                'Last_Purchase_Date': last_purchase_date,
-                'Dividend': dividend_rate,
-                'Annual Dividend': annual_dividend,
-                'Dividend Yield': f"{dividend_yield:.2f}%",
-                'Dividend_Yield_Value': dividend_yield,
-                'Payment Date': stock['payment_Date'],
-                'Current Price': f"${price:.2f}"
+                "title": title,
+                "link": link,
+                "details": author_date_str
             }
-        else:
-            logging.info(f"제외: {ticker} (배당수익률 {dividend_yield:.2f}% < 3%)")
             
     except Exception as e:
-        logging.error(f"종목 처리 오류 {stock.get('symbol', 'Unknown')}: {str(e)}")
-    
+        print(f"❌ 뉴스 크롤링 중 오류 발생: {e}")
+        
     return None
 
-def fetch_multiple_days_data(start_date, days_ahead=14):
-    """여러 날짜의 배당 데이터를 조회하여 통합"""
-    all_stocks = []
-    successful_queries = 0
-    
-    for i in range(days_ahead):
-        query_date = (start_date + timedelta(days=i)).strftime('%Y-%m-%d')
-        logging.info(f"배당 데이터 조회 중: {query_date}")
-        
-        try:
-            data = fetch_nasdaq_data(query_date)
-            if not data:
-                logging.warning(f"{query_date}: API 응답 없음")
-                continue
-                
-            # API 응답 구조 안전하게 접근
-            if not isinstance(data, dict):
-                logging.warning(f"{query_date}: API 응답이 dict가 아님 - {type(data)}")
-                continue
-                
-            data_section = data.get('data')
-            if not data_section:
-                logging.warning(f"{query_date}: 'data' 필드 없음")
-                continue
-                
-            if not isinstance(data_section, dict):
-                logging.warning(f"{query_date}: 'data' 필드가 dict가 아님 - {type(data_section)}")
-                continue
-                
-            calendar_data = data_section.get('calendar')
-            if not calendar_data:
-                logging.warning(f"{query_date}: 'calendar' 필드 없음")
-                continue
-                
-            if not isinstance(calendar_data, dict):
-                logging.warning(f"{query_date}: 'calendar' 필드가 dict가 아님 - {type(calendar_data)}")
-                continue
-                
-            rows = calendar_data.get('rows')
-            if rows is None:
-                logging.warning(f"{query_date}: 'rows' 필드가 None")
-                continue
-                
-            if not isinstance(rows, list):
-                logging.warning(f"{query_date}: 'rows'가 리스트가 아님 - {type(rows)}")
-                continue
-                
-            if len(rows) > 0:  # 빈 리스트가 아닌 경우만
-                # rows의 각 항목이 dict인지 확인
-                valid_rows = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        valid_rows.append(row)
-                    else:
-                        logging.warning(f"{query_date}: 잘못된 row 타입 - {type(row)}")
-                
-                if valid_rows:
-                    all_stocks.extend(valid_rows)
-                    logging.info(f"{query_date}: {len(valid_rows)}개 유효한 종목 발견")
-                    successful_queries += 1
-                else:
-                    logging.warning(f"{query_date}: 유효한 종목 데이터 없음")
-            else:
-                logging.info(f"{query_date}: 배당 데이터 없음 (빈 배열)")
-                
-        except Exception as e:
-            logging.error(f"{query_date}: 데이터 처리 중 예상치 못한 오류 - {str(e)}")
-            continue
-    
-    logging.info(f"총 {len(all_stocks)}개 종목 데이터 수집 완료 ({successful_queries}/{days_ahead} 성공)")
-    return all_stocks
-
 def main():
-    try:
-        # 현재 동부시간 기준
-        now_et = datetime.now(EASTERN_TZ)
-        current_date = now_et.date()
-        current_time_str = now_et.strftime('%Y-%m-%d %H:%M')
-        
-        logging.info(f"프로그램 시작 - 동부시간: {current_time_str}")
+    print("🚀 맞춤형 단건 뉴스 알림 봇 구동 시작...")
+    
+    # 조건에 맞는 새로운 기사 1개만 탐색
+    news = fetch_target_news()
+    
+    if not news:
+        print("ℹ️ 조건에 맞는 새로운 기사가 없습니다.")
+        return
 
-        # 향후 2주간의 배당 데이터 조회
-        all_dividend_stocks = fetch_multiple_days_data(now_et, days_ahead=14)
-        
-        if not all_dividend_stocks:
-            logging.warning("조회한 모든 날짜에서 배당 데이터를 찾을 수 없습니다.")
-            message = (
-                f"<b>[{current_time_str} ET] 미국주식 고배당 종목 알림</b>\n\n"
-                f"⚠️ 현재 NASDAQ에서 배당 데이터를 조회할 수 없습니다.\n"
-                f"• API 응답 오류이거나 해당 기간에 배당 종목이 없을 수 있습니다.\n"
-                f"• 잠시 후 다시 시도해주세요."
-            )
-            send_telegram(message)
-            return
-
-        logging.info(f"총 {len(all_dividend_stocks)}개 종목 처리 시작")
-
-        # 종목 처리 (멀티스레딩)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            results = list(executor.map(lambda s: process_stock(s, current_date), all_dividend_stocks))
-            filtered_stocks = [res for res in results if res is not None]
-
-        # 중복 제거 (동일 심볼)
-        unique_stocks = {}
-        for stock in filtered_stocks:
-            symbol = stock['Symbol']
-            if symbol not in unique_stocks:
-                unique_stocks[symbol] = stock
-            else:
-                # 더 높은 배당수익률을 가진 것으로 유지
-                if stock['Dividend_Yield_Value'] > unique_stocks[symbol]['Dividend_Yield_Value']:
-                    unique_stocks[symbol] = stock
-
-        final_stocks = list(unique_stocks.values())
-        
-        # 배당 수익률 기준 내림차순 정렬
-        final_stocks.sort(key=lambda x: x['Dividend_Yield_Value'], reverse=True)
-
-        logging.info(f"최종 {len(final_stocks)}개 고배당 종목 선별 완료")
-
-        # 메시지 생성 및 전송
-        if not final_stocks:
-            message = (
-                f"<b>[{current_time_str} ET] 미국주식 고배당 종목 알림</b>\n\n"
-                f"현재 조건에 맞는 고배당 종목이 없습니다.\n"
-                f"(배당수익률 3% 이상, 매수 여유시간 1일 이상)"
-            )
-            send_telegram(message)
-            return
-
-        # 메시지를 여러 개로 분할하여 전송 (텔레그램 메시지 길이 제한 고려)
-        chunk_size = 8
-        total_stocks = len(final_stocks)
-        total_parts = (total_stocks + chunk_size - 1) // chunk_size
-
-        for part in range(total_parts):
-            start = part * chunk_size
-            end = min(start + chunk_size, total_stocks)
-            current_chunk = final_stocks[start:end]
-            part_num = part + 1
-            
-            message = (
-                f"<b>[고배당 종목 알림] Part {part_num}/{total_parts}</b>\n"
-                f"📅 동부시간: {current_time_str}\n"
-                f"📊 총 {total_stocks}개 종목 (배당수익률 3% 이상)\n"
-                f"⚠️ 배당 받으려면 배당락일 전 영업일까지 매수 필요\n\n"
-            )
-            
-            for idx, stock in enumerate(current_chunk, 1):
-                global_idx = start + idx
-                
-                # 최종 매수일까지 남은 일수 계산
-                try:
-                    last_purchase_date = pd.to_datetime(stock['Last_Purchase_Date']).date()
-                    days_left = (last_purchase_date - current_date).days
-                    urgency_emoji = "🔥" if days_left <= 2 else "⏰" if days_left <= 5 else "📅"
-                except:
-                    days_left = "?"
-                    urgency_emoji = "📅"
-                
-                message += (
-                    f"{urgency_emoji} <b>{global_idx}. {stock['Symbol']}</b>\n"
-                    f"🏢 {stock['Name']}\n"
-                    f"💰 현재가: {stock['Current Price']}\n"
-                    f"📈 배당수익률: <b>{stock['Dividend Yield']}</b>\n"
-                    f"💵 배당금: ${stock['Dividend']} (연 ${stock['Annual Dividend']})\n"
-                    f"🗓️ 배당락일: {stock['Ex-Date']}\n"
-                    f"⏰ 최종매수일: {stock['Last_Purchase_Date']} ({days_left}일 남음)\n"
-                    f"💳 지급일: {stock['Payment Date']}\n\n"
-                )
-
-            if not send_telegram(message):
-                logging.error(f"Part {part_num} 전송 실패")
-                sys.exit(1)
-
-        logging.info("모든 메시지 전송 완료")
-
-    except Exception as e:
-        error_msg = f"프로그램 실행 오류: {str(e)}"
-        logging.critical(error_msg, exc_info=True)
-        
-        # 에러 알림도 텔레그램으로 전송
-        send_telegram(f"🚨 <b>배당 알림 프로그램 오류</b>\n\n{error_msg}")
-        sys.exit(1)
+    # 요청하신 포맷으로 메시지 구성 (제목 키워드 포함, 기자/날짜/시간, 1건 단독 발송)
+    message = (
+        f"🚨 <b>[속보/맞춤 키워드 기사]</b>\n\n"
+        f"📌 <b>제목:</b> <a href='{news['link']}'>{news['title']}</a>\n"
+        f"✍️ <b>상세정보 (기자/시간):</b> {news['details']}\n\n"
+        f"🔗 <a href='{news['link']}'>기사 원문 읽기</a>"
+    )
+    
+    # 텔레그램 전송
+    success = send_telegram_msg(message)
+    
+    if success:
+        # 전송 성공 시 중복 방지용 링크 기록 저장
+        save_sent_link(news['link'])
+        print(f"🎉 기사 발송 및 히스토리 저장 완료: {news['title']}")
+    else:
+        print("⚠️ 텔레그램 전송 실패로 인해 히스토리를 저장하지 않습니다.")
 
 if __name__ == "__main__":
     main()
