@@ -1,5 +1,4 @@
-name: Integrated Stock & Dividend Bot
-
+name: BNF 신호 리포트
 on:
   schedule:
     - cron: '0 0 * * *'     # 1. Dividend/News Alert: 매일 UTC 00:00 (한국 시간 오전 9시)
